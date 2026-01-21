@@ -1,6 +1,7 @@
 import logging
 import io
 import os
+import base64
 import json
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
@@ -11,20 +12,13 @@ from telegram.ext import (
     filters,
     CallbackQueryHandler
 )
-import google.generativeai as genai
 from PIL import Image
 from datetime import datetime
+import requests
 
 # ========== إعدادات ==========
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
-GOOGLE_API_KEY = os.environ.get("GOOGLE_API_KEY")
-
-# إعداد Gemini
-if GOOGLE_API_KEY:
-    genai.configure(api_key=GOOGLE_API_KEY)
-    model = genai.GenerativeModel('gemini-1.5-flash')
-else:
-    print("⚠️ تحذير: GOOGLE_API_KEY غير موجود")
+OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
 
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
@@ -32,38 +26,93 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# ========== دوال المساعدة ==========
-async def split_gemini_response(response_text):
-    """تقسيم استجابة Gemini إلى أجزاء"""
+# ========== دوال OpenAI ==========
+async def analyze_image_with_openai(image_bytes):
+    """تحليل الصورة باستخدام OpenAI GPT-4 Vision"""
+    
+    # تحويل الصورة إلى base64
+    image_base64 = base64.b64encode(image_bytes.getvalue()).decode('utf-8')
+    
+    headers = {
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {OPENAI_API_KEY}"
+    }
+    
+    payload = {
+        "model": "gpt-4-vision-preview",
+        "messages": [
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "text",
+                        "text": """Analyze this image and create:
+
+1. **English Prompt**: Detailed description in English suitable for AI image generation
+2. **Arabic Translation**: Accurate Arabic translation
+3. **Enhanced Prompt**: Professional version with artistic keywords
+4. **Keywords**: 5-10 keywords separated by commas
+
+Format:
+[EN]: [text]
+[AR]: [text]
+[ENHANCED]: [text]
+[KEYWORDS]: [text]"""
+                    },
+                    {
+                        "type": "image_url",
+                        "image_url": {
+                            "url": f"data:image/jpeg;base64,{image_base64}"
+                        }
+                    }
+                ]
+            }
+        ],
+        "max_tokens": 500
+    }
+    
+    try:
+        response = requests.post(
+            "https://api.openai.com/v1/chat/completions",
+            headers=headers,
+            json=payload
+        )
+        
+        if response.status_code == 200:
+            result = response.json()
+            return result['choices'][0]['message']['content']
+        else:
+            logger.error(f"OpenAI API Error: {response.status_code}")
+            return None
+            
+    except Exception as e:
+        logger.error(f"Error calling OpenAI API: {e}")
+        return None
+
+async def parse_openai_response(response_text):
+    """تقسيم استجابة OpenAI إلى أجزاء"""
     result = {
         "english": "لم أتمكن من استخراج النص الإنجليزي",
         "arabic": "لم أتمكن من استخراج النص العربي",
-        "enhanced": "لم أتمكن من إنشاء اقتراح محسن"
+        "enhanced": "لم أتمكن من إنشاء اقتراح محسن",
+        "keywords": "صورة, فنية"
     }
     
     try:
         lines = response_text.split('\n')
         
-        # البحث عن الأقسام
-        for i, line in enumerate(lines):
-            if "**English Prompt:**" in line:
-                result["english"] = lines[i+1].strip() if i+1 < len(lines) else line.replace("**English Prompt:**", "").strip()
-            elif "**Arabic:**" in line:
-                result["arabic"] = lines[i+1].strip() if i+1 < len(lines) else line.replace("**Arabic:**", "").strip()
-            elif "**Enhanced Prompt:**" in line:
-                result["enhanced"] = lines[i+1].strip() if i+1 < len(lines) else line.replace("**Enhanced Prompt:**", "").strip()
+        for line in lines:
+            if line.startswith('[EN]:'):
+                result["english"] = line.replace('[EN]:', '').strip()
+            elif line.startswith('[AR]:'):
+                result["arabic"] = line.replace('[AR]:', '').strip()
+            elif line.startswith('[ENHANCED]:'):
+                result["enhanced"] = line.replace('[ENHANCED]:', '').strip()
+            elif line.startswith('[KEYWORDS]:'):
+                result["keywords"] = line.replace('[KEYWORDS]:', '').strip()
         
-        # إذا لم تكن هناك أقسام واضحة، نستخدم النص كما هو
         if result["english"].startswith("لم أتمكن"):
-            result["english"] = response_text[:500]  # أول 500 حرف
-        
-        # إنشاء اقتراح محسن تلقائياً
-        if result["enhanced"].startswith("لم أتمكن"):
-            result["enhanced"] = f"Professional AI art, {result['english'][:200]}, detailed, 4K, masterpiece, trending on ArtStation"
-        
-        # ترجمة مبسطة للعربية إذا لم يكن موجوداً
-        if result["arabic"].startswith("لم أتمكن"):
-            result["arabic"] = f"وصف عربي: {result['english'][:100]}"
+            result["english"] = response_text[:300]
             
     except Exception as e:
         logger.error(f"خطأ في تقسيم الاستجابة: {e}")
@@ -74,10 +123,10 @@ async def split_gemini_response(response_text):
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """معالجة أمر /start"""
     welcome_text = """
-🖼️ *مرحباً بك في بوت استخراج البرومبت الذكي!*
+🖼️ *مرحباً بك في بوت استخراج البرومبت مع GPT-4 Vision!*
 
 ✨ *المميزات:*
-• استخراج وصف دقيق للصور باستخدام Gemini AI
+• استخراج وصف دقيق للصور باستخدام OpenAI GPT-4
 • برومبت باللغتين العربية والإنجليزية
 • اقتراحات محسنة للفن الرقمي
 • نسخ البرومنت بنقرة واحدة
@@ -87,108 +136,52 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 2. انتظر التحليل
 3. اختر من الأزرار ما تريد
 
-💡 *نصائح:*
-• استخدم صوراً واضحة لنتائج أفضل
-• يمكنك طلب اقتراحات محسنة للإبداع
-• استخدم أزرار النسخ للنسخ السريع
-
 ابدأ الآن بأرسال صورة! 📸
 """
     
-    keyboard = [
-        [InlineKeyboardButton("📸 أرسل صورة", switch_inline_query_current_chat="")],
-        [InlineKeyboardButton("🆘 المساعدة", callback_data="help")]
-    ]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    
-    await update.message.reply_text(
-        welcome_text, 
-        parse_mode='Markdown',
-        reply_markup=reply_markup
-    )
-
-async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """معالجة أمر /help"""
-    help_text = """
-❓ *كيفية استخدام البوت:*
-
-1. *أرسل صورة* - أي صورة تريد تحليلها
-2. *انتظر* - سيقوم الذكاء الاصطناعي بتحليلها
-3. *اختر* - استخدم الأزرار للنسخ أو الاقتراحات
-
-🔧 *الأوامر المتاحة:*
-/start - بدء البوت
-/help - هذه الرسالة
-/settings - الإعدادات (قريباً)
-
-📞 *للتواصل والدعم:* @YourSupportUsername
-"""
-    await update.message.reply_text(help_text, parse_mode='Markdown')
+    await update.message.reply_text(welcome_text, parse_mode='Markdown')
 
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """معالجة الصور المستلمة"""
-    if not GOOGLE_API_KEY:
-        await update.message.reply_text(
-            "⚠️ *Google API Key غير مضبوط*\n\n"
-            "يجب إضافة المفتاح في:\n"
-            "1. ملف .env محلياً\n"
-            "2. Environment Variables على Render",
-            parse_mode='Markdown'
-        )
+    if not OPENAI_API_KEY:
+        await update.message.reply_text("⚠️ OPENAI_API_KEY غير موجود")
         return
     
     try:
-        # إعلام المستخدم بالمعالجة
-        processing_msg = await update.message.reply_text("🔄 جاري تحليل الصورة باستخدام Gemini AI...")
+        processing_msg = await update.message.reply_text("🔄 جاري تحليل الصورة مع GPT-4...")
         
         # تحميل الصورة
         photo = await update.message.photo[-1].get_file()
         img_bytes = io.BytesIO()
         await photo.download_to_memory(img_bytes)
         img_bytes.seek(0)
-        image = Image.open(img_bytes)
         
-        # إنشاء prompt ذكي لـ Gemini
-        analysis_prompt = """
-        قم بتحليل هذه الصورة وأنشئ:
+        # تحليل الصورة باستخدام OpenAI
+        response_text = await analyze_image_with_openai(img_bytes)
         
-        **English Prompt:** [وصف إنجليزي دقيق ومفصل للصورة، مناسب لتوليد الصور بالذكاء الاصطناعي، شامل للألوان والضوء والمشاعر والتكوين]
-        
-        **Arabic:** [ترجمة عربية دقيقة للوصف السابق، مع الحفاظ على الجودة الفنية]
-        
-        **Enhanced Prompt:** [اقتراح محسن ومفصل أكثر للفن الرقمي، بإضافة كلمات مثل masterpiece, 4K, professional photography, trending on ArtStation]
-        
-        **Tags:** [كلمات مفتاحية منفصلة بفواصل]
-        
-        كن دقيقاً ومفصلاً قدر الإمكان.
-        """
-        
-        # إرسال الطلب لـ Gemini
-        response = model.generate_content([analysis_prompt, image])
+        if not response_text:
+            await processing_msg.delete()
+            await update.message.reply_text("❌ فشل في تحليل الصورة")
+            return
         
         # تقسيم الاستجابة
-        prompts = await split_gemini_response(response.text)
+        prompts = await parse_openai_response(response_text)
         
-        # إنشاء لوحة الأزرار
+        # إنشاء أزرار
         keyboard = [
             [
-                InlineKeyboardButton("📋 نسخ الإنجليزي", callback_data=f"copy_en:{prompts['english'][:100]}"),
-                InlineKeyboardButton("📋 نسخ العربي", callback_data=f"copy_ar:{prompts['arabic'][:100]}")
+                InlineKeyboardButton("📋 نسخ الإنجليزي", callback_data=f"copy_en:{prompts['english'][:50]}"),
+                InlineKeyboardButton("📋 نسخ العربي", callback_data=f"copy_ar:{prompts['arabic'][:50]}")
             ],
             [
-                InlineKeyboardButton("✨ اقتراح محسن", callback_data=f"copy_enhanced:{prompts['enhanced'][:100]}"),
-                InlineKeyboardButton("🔄 إعادة توليد", callback_data="regenerate")
-            ],
-            [
-                InlineKeyboardButton("🎨 توليد صورة", callback_data="generate_image"),
-                InlineKeyboardButton("💾 حفظ", callback_data="save_prompt")
+                InlineKeyboardButton("✨ اقتراح محسن", callback_data=f"copy_enhanced:{prompts['enhanced'][:50]}")
             ]
         ]
         reply_markup = InlineKeyboardMarkup(keyboard)
         
         # إعداد النتيجة
         result_text = f"""
-✅ *تم تحليل الصورة بنجاح!*
+✅ *تم تحليل الصورة مع GPT-4 Vision!*
 
 🇺🇸 *الوصف الإنجليزي:*
 `{prompts['english']}`
@@ -199,15 +192,10 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
 ✨ *الاقتراح المحسن:*
 `{prompts['enhanced']}`
 
-📊 *المعلومات:*
-• الوقت: {datetime.now().strftime('%H:%M:%S')}
-• النموذج: Gemini 1.5 Flash
-• الطول: {len(prompts['english']) + len(prompts['arabic'])} حرف
-
-استخدم الأزرار أدناه للتفاعل ⬇️
+🏷️ *الكلمات المفتاحية:*
+{', '.join(prompts['keywords'].split(',')[:10])}
 """
         
-        # حذف رسالة المعالجة وإرسال النتيجة
         await processing_msg.delete()
         await update.message.reply_text(
             result_text,
@@ -216,16 +204,8 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         
     except Exception as e:
-        logger.error(f"خطأ في معالجة الصورة: {e}")
-        await update.message.reply_text(
-            "❌ *حدث خطأ أثناء المعالجة*\n\n"
-            "الأسباب المحتملة:\n"
-            "• مشكلة في اتصال الإنترنت\n"
-            "• الصورة كبيرة جداً\n"
-            "• مشكلة في Gemini API\n\n"
-            "حاول مرة أخرى أو أرسل صورة مختلفة.",
-            parse_mode='Markdown'
-        )
+        logger.error(f"خطأ: {e}")
+        await update.message.reply_text("❌ حدث خطأ أثناء المعالجة")
 
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """معالجة نقرات الأزرار"""
@@ -236,81 +216,33 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     if data.startswith("copy_en:"):
         text = data.split(":", 1)[1]
-        await query.edit_message_text(
-            f"✅ *تم نسخ البرومبت الإنجليزي:*\n\n`{text}`\n\n"
-            "يمكنك لصقه في:\n"
-            "• Midjourney\n• Stable Diffusion\n• DALL-E\n• أي مولد صور",
-            parse_mode='Markdown'
-        )
+        await query.edit_message_text(f"✅ تم نسخ البرومبت الإنجليزي:\n\n`{text}`")
         
     elif data.startswith("copy_ar:"):
         text = data.split(":", 1)[1]
-        await query.edit_message_text(
-            f"✅ *تم نسخ البرومبت العربي:*\n\n`{text}`\n\n"
-            "مناسب للاستخدام في:\n"
-            "• التطبيقات العربية\n• شرح الصور\n• الترجمة",
-            parse_mode='Markdown'
-        )
+        await query.edit_message_text(f"✅ تم نسخ البرومبت العربي:\n\n`{text}`")
         
     elif data.startswith("copy_enhanced:"):
         text = data.split(":", 1)[1]
-        await query.edit_message_text(
-            f"✨ *تم نسخ الاقتراح المحسن:*\n\n`{text}`\n\n"
-            "هذا الاقتراح محسن للفن الرقمي ويعطي نتائج أفضل!",
-            parse_mode='Markdown'
-        )
-        
-    elif data == "regenerate":
-        await query.edit_message_text(
-            "🔄 *جاري إعادة توليد الوصف...*\n\n"
-            "سيتم إرسال طلب جديد لـ Gemini",
-            parse_mode='Markdown'
-        )
-        # هنا يمكن إضافة منطق لإعادة التوليد
-        
-    elif data == "generate_image":
-        await query.edit_message_text(
-            "🎨 *توليد الصورة*\n\n"
-            "هذه الميزة قيد التطوير!\n"
-            "ستتوفر قريباً لتوليد صور من البرومبت",
-            parse_mode='Markdown'
-        )
-        
-    elif data == "save_prompt":
-        await query.edit_message_text(
-            "💾 *حفظ البرومبت*\n\n"
-            "تم حفظ البرومبت في قاعدة البيانات\n"
-            "يمكنك الوصول إليه لاحقاً",
-            parse_mode='Markdown'
-        )
-        
-    elif data == "help":
-        await help_command(query, context)
+        await query.edit_message_text(f"✨ تم نسخ الاقتراح المحسن:\n\n`{text}`")
 
 # ========== الدالة الرئيسية ==========
 def main():
     """تشغيل البوت"""
     if not TELEGRAM_BOT_TOKEN:
-        print("❌ خطأ: TELEGRAM_BOT_TOKEN غير موجود!")
-        print("أضفه في ملف .env أو Environment Variables")
+        print("❌ TELEGRAM_BOT_TOKEN غير موجود!")
         return
     
-    if not GOOGLE_API_KEY:
-        print("⚠️  تحذير: GOOGLE_API_KEY غير موجود - بعض الميزات لن تعمل")
+    if not OPENAI_API_KEY:
+        print("⚠️ OPENAI_API_KEY غير موجود")
     
     try:
-        # بناء التطبيق
         app = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
-        
-        # إضافة المعالجات
         app.add_handler(CommandHandler("start", start))
-        app.add_handler(CommandHandler("help", help_command))
         app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
         app.add_handler(CallbackQueryHandler(button_handler))
         
-        # بدء التشغيل
         print("✅ البوت يعمل الآن...")
-        print(f"📊 معلومات السيرفر: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
         app.run_polling()
         
     except Exception as e:
