@@ -39,7 +39,7 @@ async def analyze_image_with_openai(image_bytes):
     }
     
     payload = {
-        "model": "gpt-4-vision-preview",
+        "model": "gpt-4o",
         "messages": [
             {
                 "role": "user",
@@ -62,27 +62,29 @@ Format:
                     {
                         "type": "image_url",
                         "image_url": {
-                            "url": f"data:image/jpeg;base64,{image_base64}"
+                            "url": f"data:image/jpeg;base64,{image_base64}",
+                            "detail": "high"
                         }
                     }
                 ]
             }
         ],
-        "max_tokens": 500
+        "max_tokens": 1000
     }
     
     try:
         response = requests.post(
             "https://api.openai.com/v1/chat/completions",
             headers=headers,
-            json=payload
+            json=payload,
+            timeout=30
         )
         
         if response.status_code == 200:
             result = response.json()
             return result['choices'][0]['message']['content']
         else:
-            logger.error(f"OpenAI API Error: {response.status_code}")
+            logger.error(f"OpenAI API Error: {response.status_code} - {response.text}")
             return None
             
     except Exception as e:
@@ -103,6 +105,183 @@ async def parse_openai_response(response_text):
         
         for line in lines:
             if line.startswith('[EN]:'):
+                result["english"] = line.replace('[EN]:', '').strip()
+            elif line.startswith('[AR]:'):
+                result["arabic"] = line.replace('[AR]:', '').strip()
+            elif line.startswith('[ENHANCED]:'):
+                result["enhanced"] = line.replace('[ENHANCED]:', '').strip()
+            elif line.startswith('[KEYWORDS]:'):
+                result["keywords"] = line.replace('[KEYWORDS]:', '').strip()
+        
+        if result["english"].startswith("لم أتمكن"):
+            result["english"] = response_text[:300]
+            
+    except Exception as e:
+        logger.error(f"خطأ في تقسيم الاستجابة: {e}")
+    
+    return result
+
+# ========== معالجات الأوامر ==========
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """معالجة أمر /start"""
+    welcome_text = """
+🖼️ *مرحباً بك في بوت استخراج البرومبت مع GPT-4!*
+
+✨ *المميزات:*
+• استخراج وصف دقيق للصور باستخدام OpenAI GPT-4
+• برومبت باللغتين العربية والإنجليزية
+• اقتراحات محسنة للفن الرقمي
+• نسخ البرومبت بنقرة واحدة
+
+📤 *كيفية الاستخدام:*
+1. أرسل لي صورة
+2. انتظر التحليل
+3. اختر من الأزرار ما تريد
+
+ابدأ الآن بإرسال صورة! 📸
+"""
+    
+    await update.message.reply_text(welcome_text, parse_mode='Markdown')
+
+async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """معالجة الصور المستلمة"""
+    if not OPENAI_API_KEY:
+        await update.message.reply_text("⚠️ OPENAI_API_KEY غير موجود")
+        return
+    
+    try:
+        processing_msg = await update.message.reply_text("🔄 جاري تحليل الصورة مع GPT-4...")
+        
+        # تحميل الصورة
+        photo = await update.message.photo[-1].get_file()
+        img_bytes = io.BytesIO()
+        await photo.download_to_memory(img_bytes)
+        img_bytes.seek(0)
+        
+        # تحليل الصورة باستخدام OpenAI
+        response_text = await analyze_image_with_openai(img_bytes)
+        
+        if not response_text:
+            await processing_msg.delete()
+            await update.message.reply_text("❌ فشل في تحليل الصورة")
+            return
+        
+        # تقسيم الاستجابة
+        prompts = await parse_openai_response(response_text)
+        
+        # حفظ البيانات في context
+        user_id = update.effective_user.id
+        context.user_data[f'{user_id}_prompts'] = prompts
+        
+        # إنشاء أزرار
+        keyboard = [
+            [
+                InlineKeyboardButton("📋 نسخ الإنجليزي", callback_data="copy_en"),
+                InlineKeyboardButton("📋 نسخ العربي", callback_data="copy_ar")
+            ],
+            [
+                InlineKeyboardButton("✨ اقتراح محسن", callback_data="copy_enhanced"),
+                InlineKeyboardButton("🏷️ الكلمات المفتاحية", callback_data="copy_keywords")
+            ]
+        ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        
+        # إعداد النتيجة
+        en_preview = prompts['english'][:150] + "..." if len(prompts['english']) > 150 else prompts['english']
+        ar_preview = prompts['arabic'][:150] + "..." if len(prompts['arabic']) > 150 else prompts['arabic']
+        
+        result_text = f"""
+✅ *تم تحليل الصورة مع GPT-4!*
+
+🇺🇸 *الوصف الإنجليزي:*
+`{en_preview}`
+
+🇸🇦 *الوصف العربي:*
+`{ar_preview}`
+
+🏷️ *الكلمات المفتاحية:*
+{prompts['keywords']}
+
+_اضغط الأزرار أدناه للنسخ الكامل_ 👇
+"""
+        
+        await processing_msg.delete()
+        await update.message.reply_text(
+            result_text,
+            parse_mode='Markdown',
+            reply_markup=reply_markup
+        )
+        
+    except Exception as e:
+        logger.error(f"خطأ: {e}")
+        await update.message.reply_text(f"❌ حدث خطأ أثناء المعالجة: {str(e)}")
+
+async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """معالجة نقرات الأزرار"""
+    query = update.callback_query
+    await query.answer()
+    
+    user_id = update.effective_user.id
+    prompts = context.user_data.get(f'{user_id}_prompts', {})
+    
+    if not prompts:
+        await query.edit_message_text("❌ انتهت صلاحية البيانات. أرسل صورة جديدة.")
+        return
+    
+    data = query.data
+    
+    if data == "copy_en":
+        text = prompts.get('english', 'غير متوفر')
+        await query.edit_message_text(
+            f"✅ *البرومبت الإنجليزي:*\n\n`{text}`",
+            parse_mode='Markdown'
+        )
+        
+    elif data == "copy_ar":
+        text = prompts.get('arabic', 'غير متوفر')
+        await query.edit_message_text(
+            f"✅ *البرومبت العربي:*\n\n`{text}`",
+            parse_mode='Markdown'
+        )
+        
+    elif data == "copy_enhanced":
+        text = prompts.get('enhanced', 'غير متوفر')
+        await query.edit_message_text(
+            f"✨ *الاقتراح المحسن:*\n\n`{text}`",
+            parse_mode='Markdown'
+        )
+    
+    elif data == "copy_keywords":
+        text = prompts.get('keywords', 'غير متوفر')
+        await query.edit_message_text(
+            f"🏷️ *الكلمات المفتاحية:*\n\n`{text}`",
+            parse_mode='Markdown'
+        )
+
+# ========== الدالة الرئيسية ==========
+def main():
+    """تشغيل البوت"""
+    if not TELEGRAM_BOT_TOKEN:
+        print("❌ TELEGRAM_BOT_TOKEN غير موجود!")
+        return
+    
+    if not OPENAI_API_KEY:
+        print("⚠️ OPENAI_API_KEY غير موجود")
+    
+    try:
+        app = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
+        app.add_handler(CommandHandler("start", start))
+        app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
+        app.add_handler(CallbackQueryHandler(button_handler))
+        
+        print("✅ البوت يعمل الآن...")
+        app.run_polling()
+        
+    except Exception as e:
+        logger.error(f"فشل تشغيل البوت: {e}")
+
+if __name__ == "__main__":
+    main()            if line.startswith('[EN]:'):
                 result["english"] = line.replace('[EN]:', '').strip()
             elif line.startswith('[AR]:'):
                 result["arabic"] = line.replace('[AR]:', '').strip()
