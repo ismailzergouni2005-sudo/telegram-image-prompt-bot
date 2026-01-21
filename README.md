@@ -1,1 +1,0 @@
-# telegram-image-prompt-bot
